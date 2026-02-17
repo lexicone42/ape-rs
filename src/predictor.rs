@@ -1,257 +1,238 @@
-//! Linear predictor for APE decoding.
+//! Linear predictor for APE decoding (v3.99+).
 //!
-//! The predictor reconstructs audio samples from the filtered residuals.
-//! It uses two adaptive filters per channel:
-//!   - Filter A: 4 coefficients, uses delayed samples
-//!   - Filter B: 5 coefficients, uses cross-channel correlation (stereo)
+//! Reconstructs audio samples from NNFilter'd residuals using adaptive
+//! linear prediction with a sliding delay buffer.
 //!
-//! For stereo, the X (left-ish) and Y (right-ish) channels are decoded
-//! separately, then combined via inverse joint-stereo decorrelation.
+//! Based on FFmpeg's predictor_decode_mono_3950 / predictor_update_filter
+//! (v3990 uses the v3950 predictor).
 
 const HISTORY_SIZE: usize = 512;
-const PREDICTOR_ORDER: usize = 8;
 const PREDICTOR_SIZE: usize = 50;
 
-// Delay buffer offsets for the Y channel (processed first in stereo)
-const YDELAYA: usize = 18 + PREDICTOR_ORDER * 4; // 50
-const YDELAYB: usize = 18 + PREDICTOR_ORDER * 3; // 42
-// Delay buffer offsets for the X channel
-const XDELAYA: usize = 18 + PREDICTOR_ORDER * 2; // 34
-const XDELAYB: usize = 18 + PREDICTOR_ORDER;     // 26
+// Delay buffer offsets (relative to current buf position)
+const YDELAYA: usize = 18 + 8 * 4; // 50
+const YDELAYB: usize = 18 + 8 * 3; // 42
+const XDELAYA: usize = 18 + 8 * 2; // 34
+const XDELAYB: usize = 18 + 8;     // 26
 
-// Adaptation coefficient offsets
+// Adaptation sign positions (relative to current buf position)
 const YADAPTCOEFFSA: usize = 18;
 const XADAPTCOEFFSA: usize = 14;
 const YADAPTCOEFFSB: usize = 10;
 const XADAPTCOEFFSB: usize = 5;
 
-/// Per-channel predictor state.
-#[derive(Clone)]
-struct ChannelPredictor {
-    /// Last prediction value (used for first-order delta).
-    last_a: i32,
-    /// Filter A output (inner prediction).
-    filter_a: i64,
-    /// Filter B output (cross-channel prediction).
-    filter_b: i64,
-    /// Filter A coefficients (4 taps).
-    coeffs_a: [i32; 4],
-    /// Filter B coefficients (5 taps).
-    coeffs_b: [i32; 5],
-}
+/// Initial filter A coefficients for v3.93+.
+const INITIAL_COEFFS_A: [i64; 4] = [360, 317, -109, 98];
 
-impl ChannelPredictor {
-    fn new() -> Self {
-        ChannelPredictor {
-            last_a: 0,
-            filter_a: 0,
-            filter_b: 0,
-            coeffs_a: [0; 4],
-            coeffs_b: [0; 5],
-        }
-    }
-
-    fn reset(&mut self) {
-        self.last_a = 0;
-        self.filter_a = 0;
-        self.filter_b = 0;
-        self.coeffs_a = [0; 4];
-        self.coeffs_b = [0; 5];
-    }
+/// APE sign function: returns -1 for positive, +1 for negative, 0 for zero.
+fn apesign(x: i64) -> i64 {
+    (if x < 0 { 1 } else { 0 }) - (if x > 0 { 1 } else { 0 })
 }
 
 /// The APE predictor — handles both mono and stereo.
 pub struct Predictor {
-    /// History buffer for delay lines. Shared across channels.
-    buf: Vec<i32>,
-    /// Current position in the history buffer.
+    /// History buffer: HISTORY_SIZE + PREDICTOR_SIZE entries.
+    buf: Vec<i64>,
+    /// Current position in the history buffer (equivalent to FFmpeg's p->buf pointer).
     buf_pos: usize,
-    /// Per-channel predictor state (up to 2 channels).
-    channels: [ChannelPredictor; 2],
+    /// Per-channel state.
+    last_a: [i64; 2],
+    filter_a: [i64; 2],
+    filter_b: [i64; 2],
+    coeffs_a: [[i64; 4]; 2],
+    coeffs_b: [[i64; 5]; 2],
 }
 
 impl Predictor {
     pub fn new() -> Self {
         Predictor {
-            buf: vec![0i32; HISTORY_SIZE + PREDICTOR_SIZE],
-            buf_pos: HISTORY_SIZE,
-            channels: [ChannelPredictor::new(), ChannelPredictor::new()],
+            buf: vec![0i64; HISTORY_SIZE + PREDICTOR_SIZE],
+            buf_pos: 0,
+            last_a: [0; 2],
+            filter_a: [0; 2],
+            filter_b: [0; 2],
+            coeffs_a: [INITIAL_COEFFS_A, INITIAL_COEFFS_A],
+            coeffs_b: [[0; 5]; 2],
         }
     }
 
     /// Reset predictor state at frame boundaries.
     pub fn reset(&mut self) {
         self.buf.fill(0);
-        self.buf_pos = HISTORY_SIZE;
-        for ch in &mut self.channels {
-            ch.reset();
-        }
+        self.buf_pos = 0;
+        self.last_a = [0; 2];
+        self.filter_a = [0; 2];
+        self.filter_b = [0; 2];
+        self.coeffs_a = [INITIAL_COEFFS_A, INITIAL_COEFFS_A];
+        self.coeffs_b = [[0; 5]; 2];
     }
 
-    /// Decode a mono sample: apply predictor inverse to get the output sample.
+    /// Decode a mono sample.
     pub fn decode_mono(&mut self, input: i32) -> i32 {
-        let output = self.update_filter(0, input, YDELAYA, YADAPTCOEFFSA, None);
+        let a = input as i64;
+        let bp = self.buf_pos;
+
+        // Write current prediction to delay line
+        self.buf[bp + YDELAYA] = self.last_a[0];
+        // Compute delta (overwrites previous value at that position)
+        self.buf[bp + YDELAYA - 1] =
+            self.buf[bp + YDELAYA].wrapping_sub(self.buf[bp + YDELAYA - 1]);
+
+        // Prediction from 4 delayed values
+        let prediction_a: i64 =
+            self.buf[bp + YDELAYA]     .wrapping_mul(self.coeffs_a[0][0])
+            .wrapping_add(self.buf[bp + YDELAYA - 1].wrapping_mul(self.coeffs_a[0][1]))
+            .wrapping_add(self.buf[bp + YDELAYA - 2].wrapping_mul(self.coeffs_a[0][2]))
+            .wrapping_add(self.buf[bp + YDELAYA - 3].wrapping_mul(self.coeffs_a[0][3]));
+
+        // Reconstruct: output = input + (prediction >> 10)
+        let current_a = a.wrapping_add(prediction_a >> 10);
+        self.last_a[0] = current_a;
+
+        // Write adaptation signs
+        self.buf[bp + YADAPTCOEFFSA] = apesign(self.buf[bp + YDELAYA]);
+        self.buf[bp + YADAPTCOEFFSA - 1] = apesign(self.buf[bp + YDELAYA - 1]);
+
+        // Adapt coefficients
+        let sign = apesign(a);
+        if sign != 0 {
+            self.coeffs_a[0][0] = self.coeffs_a[0][0]
+                .wrapping_add(self.buf[bp + YADAPTCOEFFSA].wrapping_mul(sign));
+            self.coeffs_a[0][1] = self.coeffs_a[0][1]
+                .wrapping_add(self.buf[bp + YADAPTCOEFFSA - 1].wrapping_mul(sign));
+            self.coeffs_a[0][2] = self.coeffs_a[0][2]
+                .wrapping_add(self.buf[bp + YADAPTCOEFFSA - 2].wrapping_mul(sign));
+            self.coeffs_a[0][3] = self.coeffs_a[0][3]
+                .wrapping_add(self.buf[bp + YADAPTCOEFFSA - 3].wrapping_mul(sign));
+        }
+
+        // Advance buffer
+        self.buf_pos += 1;
 
         // Wrap history buffer
-        self.buf_pos += 1;
-        if self.buf_pos >= HISTORY_SIZE + PREDICTOR_SIZE - 1 {
-            self.wrap_history();
+        if self.buf_pos >= HISTORY_SIZE {
+            // Copy last PREDICTOR_SIZE entries to the front
+            for i in 0..PREDICTOR_SIZE {
+                self.buf[i] = self.buf[self.buf_pos + i];
+            }
+            // Zero the rest
+            for i in PREDICTOR_SIZE..self.buf.len() {
+                self.buf[i] = 0;
+            }
+            self.buf_pos = 0;
         }
 
-        output
+        // IIR feedback filter: filterA = currentA + (filterA * 31) >> 5
+        self.filter_a[0] = current_a
+            .wrapping_add(self.filter_a[0].wrapping_mul(31) >> 5);
+
+        self.filter_a[0] as i32
     }
 
-    /// Decode a stereo sample pair.
-    /// Takes filtered residuals for both channels, returns (left, right).
+    /// Decode a stereo sample pair. Returns (left, right).
     pub fn decode_stereo(&mut self, input_y: i32, input_x: i32) -> (i32, i32) {
-        // Decode Y channel (uses A filter with Y delays, B filter with Y-cross delays)
-        let decoded_y = self.update_filter(
-            0,
-            input_y,
-            YDELAYA,
-            YADAPTCOEFFSA,
-            Some((YDELAYB, YADAPTCOEFFSB)),
-        );
+        // Y channel (channel 0)
+        let decoded_y = self.update_filter(input_y as i64, 0, YDELAYA, YDELAYB,
+                                           YADAPTCOEFFSA, YADAPTCOEFFSB);
 
-        // Decode X channel (uses A filter with X delays, B filter with X-cross delays)
-        let decoded_x = self.update_filter(
-            1,
-            input_x,
-            XDELAYA,
-            XADAPTCOEFFSA,
-            Some((XDELAYB, XADAPTCOEFFSB)),
-        );
+        // X channel (channel 1)
+        let decoded_x = self.update_filter(input_x as i64, 1, XDELAYA, XDELAYB,
+                                           XADAPTCOEFFSA, XADAPTCOEFFSB);
 
-        // Advance buffer position
+        // Advance buffer
         self.buf_pos += 1;
-        if self.buf_pos >= HISTORY_SIZE + PREDICTOR_SIZE - 1 {
-            self.wrap_history();
+        if self.buf_pos >= HISTORY_SIZE {
+            for i in 0..PREDICTOR_SIZE {
+                self.buf[i] = self.buf[self.buf_pos + i];
+            }
+            for i in PREDICTOR_SIZE..self.buf.len() {
+                self.buf[i] = 0;
+            }
+            self.buf_pos = 0;
         }
 
-        // Inverse channel decorrelation: Y is mid-side encoded
-        // left = X - Y/2, right = left + Y  (or similar)
-        let left = decoded_x - (decoded_y / 2);
-        let right = left + decoded_y;
+        // Inverse channel decorrelation
+        let left = decoded_x.wrapping_sub(decoded_y / 2) as i32;
+        let right = left.wrapping_add(decoded_y as i32);
 
         (left, right)
     }
 
-    /// Apply the prediction filter to one sample on the given channel.
+    /// Apply prediction filter for one sample on one channel (stereo path).
     fn update_filter(
         &mut self,
+        decoded: i64,
         ch: usize,
-        input: i32,
         delay_a: usize,
-        _adapt_a: usize,
-        b_params: Option<(usize, usize)>,
-    ) -> i32 {
+        delay_b: usize,
+        adapt_a: usize,
+        adapt_b: usize,
+    ) -> i64 {
         let bp = self.buf_pos;
-        let pred = &mut self.channels[ch];
 
-        // Compute deltas from the delay line for filter A
-        let da0 = self.buf[bp - delay_a] as i64;
-        let da1 = self.buf[bp - delay_a + 1] as i64;
-        let da2 = self.buf[bp - delay_a + 2] as i64;
-        let da3 = self.buf[bp - delay_a + 3] as i64;
+        // Filter A: own-channel prediction
+        self.buf[bp + delay_a] = self.last_a[ch];
+        self.buf[bp + adapt_a] = apesign(self.buf[bp + delay_a]);
+        self.buf[bp + delay_a - 1] =
+            self.buf[bp + delay_a].wrapping_sub(self.buf[bp + delay_a - 1]);
+        self.buf[bp + adapt_a - 1] = apesign(self.buf[bp + delay_a - 1]);
 
-        // Filter A: prediction from own-channel history
-        let prediction_a = (pred.coeffs_a[0] as i64 * da0
-            + pred.coeffs_a[1] as i64 * (da0 - da1)
-            + pred.coeffs_a[2] as i64 * (da1 - da2)
-            + pred.coeffs_a[3] as i64 * (da2 - da3))
-            >> 9;
+        let prediction_a: i64 =
+            self.buf[bp + delay_a]    .wrapping_mul(self.coeffs_a[ch][0])
+            .wrapping_add(self.buf[bp + delay_a - 1].wrapping_mul(self.coeffs_a[ch][1]))
+            .wrapping_add(self.buf[bp + delay_a - 2].wrapping_mul(self.coeffs_a[ch][2]))
+            .wrapping_add(self.buf[bp + delay_a - 3].wrapping_mul(self.coeffs_a[ch][3]));
 
-        // Filter B: cross-channel or secondary prediction
-        let prediction_b = if let Some((delay_b, _adapt_b)) = b_params {
-            let db0 = self.buf[bp - delay_b] as i64;
-            let db1 = self.buf[bp - delay_b + 1] as i64;
-            let db2 = self.buf[bp - delay_b + 2] as i64;
-            let db3 = self.buf[bp - delay_b + 3] as i64;
-            let db4 = self.buf[bp - delay_b + 4] as i64;
+        // Filter B: cross-channel prediction
+        // B delay stores: filterA of the OTHER channel - IIR(filterB)
+        self.buf[bp + delay_b] = self.filter_a[ch ^ 1]
+            .wrapping_sub(self.filter_b[ch].wrapping_mul(31) >> 5);
+        self.buf[bp + adapt_b] = apesign(self.buf[bp + delay_b]);
+        self.buf[bp + delay_b - 1] =
+            self.buf[bp + delay_b].wrapping_sub(self.buf[bp + delay_b - 1]);
+        self.buf[bp + adapt_b - 1] = apesign(self.buf[bp + delay_b - 1]);
+        self.filter_b[ch] = self.filter_a[ch ^ 1];
 
-            (pred.coeffs_b[0] as i64 * db0
-                + pred.coeffs_b[1] as i64 * (db0 - db1)
-                + pred.coeffs_b[2] as i64 * (db1 - db2)
-                + pred.coeffs_b[3] as i64 * (db2 - db3)
-                + pred.coeffs_b[4] as i64 * (db3 - db4))
-                >> 9
-        } else {
-            0
-        };
+        let prediction_b: i64 =
+            self.buf[bp + delay_b]    .wrapping_mul(self.coeffs_b[ch][0])
+            .wrapping_add(self.buf[bp + delay_b - 1].wrapping_mul(self.coeffs_b[ch][1]))
+            .wrapping_add(self.buf[bp + delay_b - 2].wrapping_mul(self.coeffs_b[ch][2]))
+            .wrapping_add(self.buf[bp + delay_b - 3].wrapping_mul(self.coeffs_b[ch][3]))
+            .wrapping_add(self.buf[bp + delay_b - 4].wrapping_mul(self.coeffs_b[ch][4]));
 
-        // Combine: last_a carries the previous sample (first-order prediction)
-        let current_a = pred.last_a;
-        pred.filter_a = prediction_a;
-        pred.filter_b = prediction_b;
+        // Reconstruct
+        self.last_a[ch] = decoded
+            .wrapping_add((prediction_a.wrapping_add(prediction_b >> 1)) >> 10);
 
-        let predicted = current_a
-            + ((pred.filter_a + pred.filter_b + 1) >> 1) as i32;
-        let output = predicted + input;
+        // IIR feedback
+        self.filter_a[ch] = self.last_a[ch]
+            .wrapping_add(self.filter_a[ch].wrapping_mul(31) >> 5);
 
-        // Adapt filter A coefficients based on sign of error
-        adapt_coefficients(
-            &mut pred.coeffs_a,
-            &[da0, da0 - da1, da1 - da2, da2 - da3],
-            input,
-        );
+        // Adapt coefficients A
+        let sign = apesign(decoded);
+        if sign != 0 {
+            self.coeffs_a[ch][0] = self.coeffs_a[ch][0]
+                .wrapping_add(self.buf[bp + adapt_a].wrapping_mul(sign));
+            self.coeffs_a[ch][1] = self.coeffs_a[ch][1]
+                .wrapping_add(self.buf[bp + adapt_a - 1].wrapping_mul(sign));
+            self.coeffs_a[ch][2] = self.coeffs_a[ch][2]
+                .wrapping_add(self.buf[bp + adapt_a - 2].wrapping_mul(sign));
+            self.coeffs_a[ch][3] = self.coeffs_a[ch][3]
+                .wrapping_add(self.buf[bp + adapt_a - 3].wrapping_mul(sign));
 
-        // Adapt filter B coefficients
-        if let Some((delay_b, _)) = b_params {
-            let db0 = self.buf[bp - delay_b] as i64;
-            let db1 = self.buf[bp - delay_b + 1] as i64;
-            let db2 = self.buf[bp - delay_b + 2] as i64;
-            let db3 = self.buf[bp - delay_b + 3] as i64;
-            let db4 = self.buf[bp - delay_b + 4] as i64;
-
-            adapt_coefficients(
-                &mut pred.coeffs_b,
-                &[db0, db0 - db1, db1 - db2, db2 - db3, db3 - db4],
-                input,
-            );
+            // Adapt coefficients B
+            self.coeffs_b[ch][0] = self.coeffs_b[ch][0]
+                .wrapping_add(self.buf[bp + adapt_b].wrapping_mul(sign));
+            self.coeffs_b[ch][1] = self.coeffs_b[ch][1]
+                .wrapping_add(self.buf[bp + adapt_b - 1].wrapping_mul(sign));
+            self.coeffs_b[ch][2] = self.coeffs_b[ch][2]
+                .wrapping_add(self.buf[bp + adapt_b - 2].wrapping_mul(sign));
+            self.coeffs_b[ch][3] = self.coeffs_b[ch][3]
+                .wrapping_add(self.buf[bp + adapt_b - 3].wrapping_mul(sign));
+            self.coeffs_b[ch][4] = self.coeffs_b[ch][4]
+                .wrapping_add(self.buf[bp + adapt_b - 4].wrapping_mul(sign));
         }
 
-        // Update state
-        pred.last_a = output;
-
-        // Store in history buffer for future predictions
-        self.buf[bp] = output;
-
-        output
-    }
-
-    /// Wrap the history buffer when it's nearly full.
-    fn wrap_history(&mut self) {
-        let src = PREDICTOR_SIZE;
-        let count = HISTORY_SIZE;
-        // Move the last HISTORY_SIZE entries to the start
-        for i in 0..count {
-            self.buf[i] = self.buf[i + src];
-        }
-        // Clear the rest
-        for i in count..self.buf.len() {
-            self.buf[i] = 0;
-        }
-        self.buf_pos = HISTORY_SIZE;
-    }
-}
-
-/// Adapt filter coefficients using the sign of the error and the sign of each delay.
-fn adapt_coefficients(coeffs: &mut [i32], delays: &[i64], error: i32) {
-    if error > 0 {
-        for (c, d) in coeffs.iter_mut().zip(delays.iter()) {
-            if *d < 0 {
-                *c -= 1;
-            } else if *d > 0 {
-                *c += 1;
-            }
-        }
-    } else if error < 0 {
-        for (c, d) in coeffs.iter_mut().zip(delays.iter()) {
-            if *d < 0 {
-                *c += 1;
-            } else if *d > 0 {
-                *c -= 1;
-            }
-        }
+        self.filter_a[ch]
     }
 }

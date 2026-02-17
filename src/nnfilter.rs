@@ -1,8 +1,7 @@
-//! NNFilter — Adaptive sign-LMS FIR filter for APE decoding.
+//! NNFilter — Adaptive FIR filter for APE decoding.
 //!
-//! The NNFilter is the core complexity of Monkey's Audio. It uses sign-based
-//! LMS (Least Mean Squares) adaptation where coefficients are updated based on
-//! the sign of the error and the sign of each history sample.
+//! The NNFilter is the core complexity of Monkey's Audio. For v3.98+, it uses
+//! sign-magnitude adaptive coefficients with a running average threshold.
 //!
 //! Filter parameters vary by compression level:
 //!   Level 1000 (Fast):       no filter
@@ -33,6 +32,13 @@ pub const FILTER_FRACBITS: [[u8; MAX_STAGES]; 5] = [
     [11, 13, 15],
 ];
 
+const HISTORY_SIZE: usize = 512;
+
+/// APE sign function: returns -1 for positive, +1 for negative, 0 for zero.
+fn apesign(x: i32) -> i32 {
+    (if x < 0 { 1 } else { 0 }) - (if x > 0 { 1 } else { 0 })
+}
+
 /// One stage of the adaptive FIR filter.
 #[derive(Clone)]
 pub struct NNFilterStage {
@@ -40,114 +46,121 @@ pub struct NNFilterStage {
     order: usize,
     /// Fractional bits for rounding the dot product.
     fracbits: u8,
-    /// Filter coefficients (adapted via sign-LMS).
+    /// Filter coefficients.
     coeffs: Vec<i16>,
-    /// Adaptation coefficients: sign(history[i]) for each tap, pre-computed.
-    adapt_coeffs: Vec<i16>,
-    /// Delay line / history buffer (ring buffer, 2× order for no-wrap access).
-    history: Vec<i16>,
-    /// Current position in the history buffer.
+    /// History buffer: holds both delay values and adapt coefficients.
+    /// Layout: [adapt_init(order)] [adaptcoeffs(order)] [delay(HISTORY_SIZE)...]
+    historybuffer: Vec<i16>,
+    /// Current delay pointer position (index into historybuffer).
     delay_pos: usize,
-    /// Running average for initial adaptation step size.
-    avg: i32,
+    /// Current adaptcoeffs pointer position (index into historybuffer).
+    adapt_pos: usize,
+    /// Running average of |output|.
+    avg: u32,
 }
 
 impl NNFilterStage {
     /// Create a new filter stage with the given order and fracbits.
     pub fn new(order: usize, fracbits: u8) -> Self {
+        // Buffer layout: historybuffer[0..order*2+HISTORY_SIZE]
+        // adaptcoeffs start at [order], delay starts at [order*2]
+        let buf_size = order * 2 + HISTORY_SIZE;
         NNFilterStage {
             order,
             fracbits,
             coeffs: vec![0i16; order],
-            adapt_coeffs: vec![0i16; order],
-            history: vec![0i16; 2 * order],
-            delay_pos: order,
+            historybuffer: vec![0i16; buf_size],
+            delay_pos: order * 2,
+            adapt_pos: order,
             avg: 0,
         }
     }
 
-    /// Reset the filter state (called at frame boundaries or when history wraps).
+    /// Reset the filter state (called at frame boundaries).
     pub fn reset(&mut self) {
         self.coeffs.fill(0);
-        self.adapt_coeffs.fill(0);
-        self.history.fill(0);
-        self.delay_pos = self.order;
+        self.historybuffer.fill(0);
+        self.delay_pos = self.order * 2;
+        self.adapt_pos = self.order;
         self.avg = 0;
     }
 
     /// Apply the filter to one sample (decompress direction).
-    ///
-    /// In decompress: output = input + dot_product(coeffs, history) >> fracbits
-    /// Then adapt coefficients based on sign of error.
     pub fn decompress(&mut self, input: i32) -> i32 {
         if self.order == 0 {
             return input;
         }
 
-        let delay = self.delay_pos;
         let order = self.order;
+        let dp = self.delay_pos;
+        let ap = self.adapt_pos;
+        let sign = apesign(input);
 
-        // Compute dot product: sum(coeffs[i] * history[delay - order + i])
+        // Dot product: sum(coeffs[i] * delay[dp - order + i])
+        // AND adaptation: coeffs[i] += adaptcoeffs[ap - order + i] * sign
         let mut sum: i64 = 0;
-        let hist_start = delay - order;
         for i in 0..order {
-            sum += self.coeffs[i] as i64 * self.history[hist_start + i] as i64;
+            sum += self.coeffs[i] as i64 * self.historybuffer[dp - order + i] as i64;
+            // Adapt simultaneously
+            self.coeffs[i] = self.coeffs[i]
+                .wrapping_add((self.historybuffer[ap - order + i] as i32 * sign) as i16);
         }
 
-        // Round and add to input
-        let filtered = (sum >> self.fracbits) as i32;
-        let output = input + filtered;
+        // Round and shift
+        let rounding = 1i64 << (self.fracbits as i64 - 1);
+        let filtered = ((sum + rounding) >> self.fracbits) as i32;
 
-        // Compute the sign of the residual (input) for adaptation
-        let error_sign = if input > 0 {
-            1i16
-        } else if input < 0 {
-            -1i16
-        } else {
-            0i16
-        };
+        // Add residual
+        let res = filtered.wrapping_add(input);
 
-        // Adapt coefficients: coeffs[i] += error_sign * adapt_coeffs[i]
-        // where adapt_coeffs[i] = sign(history[i])
-        if error_sign != 0 {
-            for i in 0..order {
-                self.coeffs[i] = self.coeffs[i]
-                    .saturating_add(error_sign.saturating_mul(self.adapt_coeffs[hist_start + i]));
-            }
+        // Write to delay line (clamped to i16)
+        self.historybuffer[dp] = res.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
 
-            // Also adapt the first coefficient based on running average
-            // This is a version-specific behavior for v3.98+
-            let adapt0 = if input > 0 {
-                (((input as i64) << 16) >> (25 + self.fracbits as i64)) as i16
-            } else {
-                -((((-input as i64) << 16) >> (25 + self.fracbits as i64)) as i16)
-            };
-            self.coeffs[0] = self.coeffs[0].saturating_add(adapt0);
-        }
-
-        // Store output in history buffer and update adapt_coeffs
-        self.history[delay] = clamp_i16(output);
-        self.adapt_coeffs[delay] = if output > 0 {
-            1
-        } else if output < 0 {
-            -1
+        // Compute adaptive coefficient for current position (v3.98+ logic)
+        let absres = res.unsigned_abs();
+        let adapt_val = if absres != 0 {
+            let avg3 = self.avg as u64 * 3;
+            let avg_plus_third = self.avg as u64 + (self.avg as u64 / 3);
+            let shift = (absres as u64 > avg3) as u32
+                + (absres as u64 > avg_plus_third) as u32;
+            apesign(res) * (8 << shift)
         } else {
             0
         };
-        self.delay_pos += 1;
+        self.historybuffer[ap] = adapt_val as i16;
 
-        // Wrap history buffer when we reach the end
-        if self.delay_pos >= 2 * order {
-            // Copy the last `order` entries to the beginning
-            let src_start = order;
-            for i in 0..order {
-                self.history[i] = self.history[src_start + i];
-                self.adapt_coeffs[i] = self.adapt_coeffs[src_start + i];
-            }
-            self.delay_pos = order;
+        // Update running average
+        self.avg = ((self.avg as i64
+            + (absres as i64 - self.avg as i64) / 16) as u32)
+            .max(0);
+
+        // Decay old adaptive coefficients
+        if ap >= 1 {
+            self.historybuffer[ap - 1] >>= 1;
+        }
+        if ap >= 2 {
+            self.historybuffer[ap - 2] >>= 1;
+        }
+        if ap >= 8 {
+            self.historybuffer[ap - 8] >>= 1;
         }
 
-        output
+        // Advance pointers
+        self.delay_pos += 1;
+        self.adapt_pos += 1;
+
+        // Wrap history buffer if needed
+        if self.delay_pos >= order * 2 + HISTORY_SIZE {
+            // Move the tail back to the front
+            let tail_start = self.delay_pos - order * 2;
+            for i in 0..(order * 2) {
+                self.historybuffer[i] = self.historybuffer[tail_start + i];
+            }
+            self.delay_pos = order * 2;
+            self.adapt_pos = order;
+        }
+
+        res
     }
 }
 
@@ -179,10 +192,9 @@ impl NNFilter {
     }
 
     /// Apply all filter stages to decompress one sample.
-    /// Stages are applied in reverse order for decompression.
+    /// Stages are applied in forward order (last encoded = first decoded).
     pub fn decompress(&mut self, mut value: i32) -> i32 {
-        // Apply filters in forward order (last encoded = first decoded)
-        for stage in self.stages.iter_mut().rev() {
+        for stage in self.stages.iter_mut() {
             value = stage.decompress(value);
         }
         value
@@ -192,9 +204,4 @@ impl NNFilter {
     pub fn num_stages(&self) -> usize {
         self.stages.len()
     }
-}
-
-/// Clamp an i32 to i16 range.
-fn clamp_i16(v: i32) -> i16 {
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }

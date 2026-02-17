@@ -1,7 +1,9 @@
 //! Arithmetic range coder for APE entropy decoding.
 //!
-//! Based on the format specification for Monkey's Audio v3.99+ (version 3990).
-//! The range coder uses a 32-bit range with bottom-value normalization.
+//! Matches FFmpeg's apedec.c control flow exactly:
+//! - normalize() is called at the START of each decode (culfreq/culshift)
+//! - update() does NOT normalize
+//! - The buffer register carries bits between bytes via EXTRA_BITS mechanism
 
 // ── Range coder constants ────────────────────────────────────────────
 
@@ -10,7 +12,7 @@ const TOP_VALUE: u32 = 1u32 << (CODE_BITS - 1);
 const BOTTOM_VALUE: u32 = TOP_VALUE >> 8;
 const EXTRA_BITS: u32 = ((CODE_BITS - 2) % 8) + 1; // = 7
 
-/// Number of symbols in the frequency model (0..=20 + overflow).
+/// Number of symbols in the frequency model table.
 const MODEL_ELEMENTS: usize = 22;
 
 /// Cumulative frequency table for v3.98+ (version >= 3980).
@@ -37,24 +39,24 @@ pub struct RiceState {
 
 impl RiceState {
     pub fn new() -> Self {
-        // Initial state: k=10, ksum = (1 << k) * 16 = 16384
-        // This gives an initial pivot of ksum >> 5 = 512
         RiceState {
             k: 10,
-            ksum: 1 << 14, // 16384
+            ksum: 1 << 14, // 16384: initial pivot = 512
         }
     }
 
     /// Update the adaptive parameters after decoding a value.
+    /// Matches FFmpeg's update_rice exactly: single-expression ksum update.
     pub fn update(&mut self, x: u32) {
-        // Exponential moving average: ksum += (x+1)/2 - (ksum+16)>>5
-        let add = ((x + 1) / 2).min(u32::MAX - self.ksum);
-        self.ksum += add;
-        let sub = (self.ksum + 16) >> 5;
-        self.ksum = self.ksum.saturating_sub(sub);
+        // FFmpeg: rice->ksum += ((x + 1) / 2) - ((rice->ksum + 16) >> 5);
+        // Must use ORIGINAL ksum for the subtraction term.
+        let add = x.wrapping_add(1) / 2;
+        let sub = self.ksum.wrapping_add(16) >> 5;
+        self.ksum = self.ksum.wrapping_add(add).wrapping_sub(sub);
 
-        // Adapt k: ensure ksum is in [2^(k+4), 2^(k+5))
-        if self.k > 0 && self.ksum < (1u32 << (self.k + 4)) {
+        // FFmpeg: int lim = rice->k ? (1 << (rice->k + 4)) : 0;
+        let lim = if self.k > 0 { 1u32 << (self.k + 4) } else { 0 };
+        if self.ksum < lim {
             self.k -= 1;
         } else if self.ksum >= (1u32 << (self.k + 5)) && self.k < 24 {
             self.k += 1;
@@ -70,9 +72,15 @@ impl RiceState {
 // ── Range coder ──────────────────────────────────────────────────────
 
 /// Byte-level range coder for entropy decoding.
+///
+/// Follows FFmpeg's apedec.c structure exactly:
+/// - culshift/culfreq normalize BEFORE computing
+/// - update does NOT normalize
 pub struct RangeCoder<'a> {
     data: &'a [u8],
-    pos: usize,
+    pub pos: usize,
+    /// Accumulated byte buffer (carries bits between normalize steps).
+    pub buffer: u32,
     pub low: u32,
     pub range: u32,
     help: u32,
@@ -80,21 +88,22 @@ pub struct RangeCoder<'a> {
 
 impl<'a> RangeCoder<'a> {
     /// Initialize the range coder from a byte slice (compressed frame data).
+    /// Matches FFmpeg's range_start_decoding — does NOT normalize.
     pub fn new(data: &'a [u8]) -> Self {
         let mut rc = RangeCoder {
             data,
             pos: 0,
+            buffer: 0,
             low: 0,
             range: 1u32 << EXTRA_BITS,
             help: 0,
         };
 
-        // Read first byte and extract top EXTRA_BITS bits
-        let first = rc.read_byte();
-        rc.low = (first as u32) >> (8 - EXTRA_BITS);
+        // Read first byte into buffer, extract EXTRA_BITS for low
+        rc.buffer = rc.read_byte() as u32;
+        rc.low = rc.buffer >> (8 - EXTRA_BITS);
 
-        // Normalize to fill the range register
-        rc.normalize();
+        // Do NOT normalize here — first culshift/culfreq call will normalize
         rc
     }
 
@@ -112,146 +121,112 @@ impl<'a> RangeCoder<'a> {
     /// Renormalize: expand range by reading bytes until range > BOTTOM_VALUE.
     fn normalize(&mut self) {
         while self.range <= BOTTOM_VALUE {
-            let byte = self.read_byte();
-            self.low = (self.low << 8) | (byte as u32);
+            self.buffer = (self.buffer << 8) | (self.read_byte() as u32);
+            self.low = (self.low << 8) | ((self.buffer >> 1) & 0xFF);
             self.range <<= 8;
         }
     }
 
-    /// Decode a uniform value in [0, 2^shift) using the top `shift` bits of range.
-    fn decode_culshift(&mut self, shift: u32) -> u32 {
+    /// FFmpeg's range_decode_culshift: normalize, then decode uniform in [0, 2^shift).
+    fn culshift(&mut self, shift: u32) -> u32 {
+        self.normalize();
         self.help = self.range >> shift;
-        let value = self.low / self.help;
-        value.min((1u32 << shift) - 1)
+        self.low / self.help
     }
 
-    /// Decode a uniform value in [0, tot_f) using frequency `tot_f`.
-    fn decode_culfreq(&mut self, tot_f: u32) -> u32 {
+    /// FFmpeg's range_decode_culfreq: normalize, then decode uniform in [0, tot_f).
+    fn culfreq(&mut self, tot_f: u32) -> u32 {
+        self.normalize();
         self.help = self.range / tot_f;
-        let value = self.low / self.help;
-        value.min(tot_f - 1)
+        self.low / self.help
     }
 
-    /// Update range coder state after decoding a symbol.
-    /// `lt_f` = cumulative frequency of symbols before this one.
-    /// `sy_f` = frequency of this symbol.
-    fn decode_update(&mut self, lt_f: u32, sy_f: u32) {
+    /// FFmpeg's range_decode_update: update state (does NOT normalize).
+    fn update(&mut self, sy_f: u32, lt_f: u32) {
         self.low -= self.help * lt_f;
         self.range = self.help * sy_f;
-        self.normalize();
+    }
+
+    /// FFmpeg's range_decode_bits: culshift + update(1, sym).
+    fn decode_bits(&mut self, n: u32) -> u32 {
+        let sym = self.culshift(n);
+        self.update(1, sym);
+        sym
     }
 
     /// Decode a symbol from the frequency model (counts_3980).
-    /// Returns the symbol index (0..=20 for normal symbols, 21+ for overflow).
+    /// Matches FFmpeg's range_get_symbol exactly.
     fn get_symbol(&mut self) -> u32 {
-        let cf = self.decode_culshift(16) as u16;
+        let cf = self.culshift(16);
 
-        // Check for overflow escape (last bucket)
+        // FFmpeg's fast path for rare/overflow symbols (cf > 65492)
         if cf > 65492 {
-            // Overflow: symbol index beyond the model
-            self.decode_update(
-                COUNTS_3980[MODEL_ELEMENTS - 1] as u32,
-                65536 - COUNTS_3980[MODEL_ELEMENTS - 1] as u32,
-            );
-            return u32::MAX; // sentinel for "overflow beyond model"
+            let symbol = cf.wrapping_sub(65535).wrapping_add(63);
+            self.update(1, cf);
+            return symbol;
         }
 
-        // Binary search for the symbol in the cumulative frequency table
+        // Binary search: find largest lo where COUNTS_3980[lo] <= cf.
+        // The cf > 65492 fast path above guarantees lo will be at most 20
+        // (since cf <= 65492 means cf < COUNTS_3980[21] = 65493).
         let mut lo = 0usize;
         let mut hi = MODEL_ELEMENTS - 1;
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
-            if COUNTS_3980[mid] <= cf {
+            if (COUNTS_3980[mid] as u32) <= cf {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
 
-        self.decode_update(
-            COUNTS_3980[lo] as u32,
-            COUNTS_DIFF_3980[lo] as u32,
-        );
+        self.update(COUNTS_DIFF_3980[lo] as u32, COUNTS_3980[lo] as u32);
         lo as u32
     }
 
     /// Decode a single signed audio value using the APE v3.99 entropy scheme.
+    /// Matches FFmpeg's ape_decode_value_3990 exactly.
     pub fn decode_value(&mut self, rice: &mut RiceState) -> i32 {
         let pivot = rice.pivot();
 
-        let (base, overflow);
+        // Decode overflow FIRST (always)
+        let mut overflow = self.get_symbol();
 
-        if pivot < 65536 {
-            // Common case: small pivot, decode base directly
-            self.help = self.range / pivot;
-            let b = (self.low / self.help).min(pivot - 1);
-            self.low -= self.help * b;
-            self.range = self.help;
-            self.normalize();
-            base = b;
-
-            // Decode overflow using frequency model
-            overflow = self.get_overflow();
-        } else {
-            // Large pivot: decode overflow first, then base in two parts
-            overflow = self.get_overflow();
-
-            // Decode base in [0, pivot) using split approach
-            let pivot_bits = 32 - pivot.leading_zeros(); // ilog2(pivot) + 1
-            let shift = pivot_bits - 16;
-
-            // High 16 bits
-            self.help = self.range >> 16;
-            let base_high = (self.low / self.help).min(65535);
-            self.low -= self.help * base_high;
-            self.range = self.help;
-            self.normalize();
-
-            // Low `shift` bits
-            self.help = self.range >> shift;
-            let base_low = (self.low / self.help).min((1u32 << shift) - 1);
-            self.low -= self.help * base_low;
-            self.range = self.help;
-            self.normalize();
-
-            base = (base_high << shift) | base_low;
+        // Escape: symbol 63 (MODEL_ELEMENTS-1 in FFmpeg where MODEL_ELEMENTS=64)
+        // In our table, symbols 21-62 come from the cf>65492 fast path,
+        // symbol 63 triggers the escape.
+        if overflow == 63 {
+            overflow = (self.decode_bits(16)) << 16;
+            overflow |= self.decode_bits(16);
         }
 
-        let x = base + overflow * pivot;
+        // Decode base
+        let base;
+        if pivot < 0x10000 {
+            base = self.culfreq(pivot);
+            self.update(1, base);
+        } else {
+            let mut base_hi = pivot;
+            let mut bbits = 0u32;
+            while base_hi & !0xFFFF != 0 {
+                base_hi >>= 1;
+                bbits += 1;
+            }
+            let hi = self.culfreq(base_hi + 1);
+            self.update(1, hi);
+            let lo = self.culfreq(1u32 << bbits);
+            self.update(1, lo);
+            base = (hi << bbits) + lo;
+        }
+
+        let x = base.wrapping_add(overflow.wrapping_mul(pivot));
         rice.update(x);
 
-        // Zigzag decode: odd → positive, even → non-positive
+        // Zigzag decode: matches FFmpeg's ((x >> 1) ^ ((x & 1) - 1)) + 1
         if x & 1 != 0 {
-            ((x >> 1) + 1) as i32
+            ((x >> 1) as i32).wrapping_add(1)
         } else {
             -((x >> 1) as i32)
         }
-    }
-
-    /// Decode the overflow count using the frequency model, handling escapes.
-    fn get_overflow(&mut self) -> u32 {
-        let sym = self.get_symbol();
-
-        if sym == u32::MAX {
-            // Escaped overflow — decode the actual count
-            // The overflow is > 20; decode additional bits
-            let overflow_high = self.get_symbol();
-            if overflow_high == u32::MAX {
-                // Double escape — very rare, decode with explicit bit count
-                let bits = self.decode_culshift(5);
-                self.decode_update(bits, 1);
-                let value = self.decode_culshift(bits);
-                self.decode_update(value, 1);
-                return value + (MODEL_ELEMENTS as u32 - 1);
-            }
-            overflow_high + (MODEL_ELEMENTS as u32 - 1)
-        } else {
-            sym
-        }
-    }
-
-    /// Current byte position in the data.
-    pub fn position(&self) -> usize {
-        self.pos
     }
 }

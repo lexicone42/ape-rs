@@ -111,6 +111,10 @@ impl<R: Read + Seek> Decoder<R> {
     }
 
     /// Read compressed data for the current frame.
+    ///
+    /// Reads from a 4-byte-aligned file position (matching FFmpeg's bswap_buf
+    /// alignment) and byte-swaps each 4-byte group so the range coder sees
+    /// bytes in the correct order.
     fn read_frame_data(&mut self) -> Result<Vec<u8>, ApeError> {
         let frame_idx = self.current_frame as usize;
         let seek_table = &self.header.seek_table;
@@ -119,7 +123,8 @@ impl<R: Read + Seek> Decoder<R> {
             return Err(ApeError::InvalidSeekTable);
         }
 
-        let start = seek_table[frame_idx] as u64;
+        // Start at 4-byte aligned position (low 2 bits are alignment skip)
+        let start = (seek_table[frame_idx] & !3) as u64;
 
         // End is either the next frame's offset or end of frame data
         let end = if frame_idx + 1 < seek_table.len() {
@@ -141,7 +146,57 @@ impl<R: Read + Seek> Decoder<R> {
         let mut data = vec![0u8; size];
         self.reader.read_exact(&mut data)?;
 
+        // Byte-swap each 4-byte group (matching FFmpeg's bswap_buf).
+        // APE stores data as little-endian 32-bit words; the range coder
+        // expects the bytes in big-endian order within each word.
+        let full_words = size / 4;
+        for i in 0..full_words {
+            let off = i * 4;
+            data.swap(off, off + 3);
+            data.swap(off + 1, off + 2);
+        }
+
         Ok(data)
+    }
+
+    /// Skip the per-frame header: alignment bytes, CRC, optional frame flags, skip byte.
+    /// Returns a slice pointing to the start of range-coded data.
+    fn skip_frame_header<'a>(&self, frame_data: &'a [u8]) -> Result<&'a [u8], ApeError> {
+        let mut pos = 0usize;
+
+        // Skip byte-alignment padding (low 2 bits of seek table entry)
+        let align_skip = (self.header.seek_table[self.current_frame as usize] & 3) as usize;
+        pos += align_skip;
+
+        if pos + 4 > frame_data.len() {
+            return Err(ApeError::UnexpectedEof);
+        }
+
+        // Read 4-byte big-endian CRC
+        let crc = u32::from_be_bytes([
+            frame_data[pos],
+            frame_data[pos + 1],
+            frame_data[pos + 2],
+            frame_data[pos + 3],
+        ]);
+        pos += 4;
+
+        // If CRC has high bit set, next 4 bytes are frame flags
+        if crc & 0x80000000 != 0 {
+            if pos + 4 > frame_data.len() {
+                return Err(ApeError::UnexpectedEof);
+            }
+            // frame flags — we don't use them yet but must skip
+            pos += 4;
+        }
+
+        // Skip 1 byte (the first 8 bits of input are ignored by the range coder)
+        if pos >= frame_data.len() {
+            return Err(ApeError::UnexpectedEof);
+        }
+        pos += 1;
+
+        Ok(&frame_data[pos..])
     }
 
     /// Decode a mono frame.
@@ -150,9 +205,7 @@ impl<R: Read + Seek> Decoder<R> {
         frame_data: &[u8],
         nblocks: u32,
     ) -> Result<(), ApeError> {
-        // Skip initial frame alignment bytes (0-3 bytes based on seek table offset)
-        let skip = (self.header.seek_table[self.current_frame as usize] & 3) as usize;
-        let data = &frame_data[skip..];
+        let data = self.skip_frame_header(frame_data)?;
 
         let mut rc = RangeCoder::new(data);
         let mut rice = RiceState::new();
@@ -179,8 +232,7 @@ impl<R: Read + Seek> Decoder<R> {
         frame_data: &[u8],
         nblocks: u32,
     ) -> Result<(), ApeError> {
-        let skip = (self.header.seek_table[self.current_frame as usize] & 3) as usize;
-        let data = &frame_data[skip..];
+        let data = self.skip_frame_header(frame_data)?;
 
         let mut rc = RangeCoder::new(data);
         let mut rice_y = RiceState::new();
