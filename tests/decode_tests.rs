@@ -22,7 +22,6 @@ fn parse_header() {
     eprintln!("  Total samples: {}", info.total_samples);
     eprintln!("  Compression level: {}", info.compression_level);
 
-    // Basic sanity checks
     assert!(info.sample_rate == 44100 || info.sample_rate == 48000,
         "Unexpected sample rate: {}", info.sample_rate);
     assert!(info.channels == 1 || info.channels == 2,
@@ -44,10 +43,9 @@ fn decode_first_frame() {
     let mut reader = ApeReader::open(TEST_APE).expect("Failed to open APE file");
     let info = reader.info().clone();
 
-    // Try to decode some samples
     let mut count = 0u64;
     let mut errors = 0u64;
-    let limit = (info.sample_rate as u64) * info.channels as u64; // ~1 second
+    let limit = (info.sample_rate as u64) * info.channels as u64;
 
     for result in reader.samples() {
         match result {
@@ -94,57 +92,7 @@ fn full_decode_sample_count() {
     assert_eq!(count, expected, "Sample count mismatch");
 }
 
-#[test]
-fn dump_first_samples() {
-    if !Path::new(TEST_APE).exists() || !Path::new(TEST_WAV).exists() {
-        return;
-    }
-    let mut reader = ApeReader::open(TEST_APE).expect("open");
-    let info = reader.info().clone();
-    let wav_data = std::fs::read(TEST_WAV).expect("read wav");
-    let wav_samples = parse_wav_samples(&wav_data, info.bits_per_sample);
-
-    // Decode first 441000 samples (10 seconds at 44100 mono)
-    let mut ape_samples = Vec::new();
-    for result in reader.samples() {
-        if ape_samples.len() >= 441000 { break; }
-        ape_samples.push(result.unwrap());
-    }
-
-    // Find first non-zero WAV sample
-    let first_nonzero = wav_samples.iter().position(|&s| s != 0).unwrap_or(0);
-    eprintln!("First non-zero WAV sample at index {first_nonzero}");
-
-    // Show samples around that point
-    let start = first_nonzero.saturating_sub(5);
-    eprintln!("{:>8} {:>12} {:>12} {:>12}", "idx", "APE", "WAV", "diff");
-    for i in start..start + 30 {
-        if i >= ape_samples.len() { break; }
-        let a = ape_samples[i];
-        let w = wav_samples[i];
-        eprintln!("{:>8} {:>12} {:>12} {:>12}", i, a, w, a as i64 - w as i64);
-    }
-
-    // Also show first mismatch
-    let first_mismatch = (0..ape_samples.len().min(wav_samples.len()))
-        .find(|&i| ape_samples[i] != wav_samples[i]);
-    if let Some(idx) = first_mismatch {
-        eprintln!("\nFirst mismatch at index {idx}:");
-        let s = idx.saturating_sub(3);
-        for i in s..s + 10 {
-            if i >= ape_samples.len() { break; }
-            let a = ape_samples[i];
-            let w = wav_samples[i];
-            let marker = if a != w { " <--" } else { "" };
-            eprintln!("{:>8} {:>12} {:>12} {:>12}{}", i, a, w, a as i64 - w as i64, marker);
-        }
-    } else {
-        eprintln!("First {} samples match perfectly!", ape_samples.len());
-    }
-}
-
 /// Compare decoded APE samples against a WAV reference (ffmpeg-decoded).
-/// Only checks the first N samples to keep test fast.
 #[test]
 fn compare_to_wav_reference() {
     if !Path::new(TEST_APE).exists() || !Path::new(TEST_WAV).exists() {
@@ -152,7 +100,6 @@ fn compare_to_wav_reference() {
         return;
     }
 
-    // Decode ALL samples from APE
     let mut reader = ApeReader::open(TEST_APE).expect("Failed to open APE file");
     let info = reader.info().clone();
     let check_samples = info.total_samples as usize;
@@ -165,7 +112,6 @@ fn compare_to_wav_reference() {
         ape_samples.push(result.expect("APE decode error"));
     }
 
-    // Read WAV reference
     let wav_data = std::fs::read(TEST_WAV).expect("Failed to read WAV");
     let wav_samples = parse_wav_samples(&wav_data, info.bits_per_sample);
 
@@ -173,44 +119,178 @@ fn compare_to_wav_reference() {
     eprintln!("Comparing {compare_len} samples (APE has {}, WAV has {})",
         ape_samples.len(), wav_samples.len());
 
-    let mut max_diff = 0i64;
-    let mut total_diff = 0i64;
-    let mut mismatches = 0u64;
+    assert_bit_exact(&ape_samples, &wav_samples, compare_len, "test.ape (mono c4000)");
+}
 
-    for i in 0..compare_len {
-        let diff = (ape_samples[i] as i64 - wav_samples[i] as i64).abs();
+// ── Compression level tests: mono ──────────────────────────────────
+
+#[test]
+fn mono_c1000_fast() {
+    verify_ape_vs_wav(
+        "tests/data/test_mono_c1000.ape",
+        "tests/data/test_mono_reference.wav",
+        1, 1000,
+    );
+}
+
+#[test]
+fn mono_c2000_normal() {
+    verify_ape_vs_wav(
+        "tests/data/test_mono_c2000.ape",
+        "tests/data/test_mono_reference.wav",
+        1, 2000,
+    );
+}
+
+#[test]
+fn mono_c3000_high() {
+    verify_ape_vs_wav(
+        "tests/data/test_mono_c3000.ape",
+        "tests/data/test_mono_reference.wav",
+        1, 3000,
+    );
+}
+
+#[test]
+fn mono_c4000_extra_high() {
+    verify_ape_vs_wav(
+        "tests/data/test_mono_c4000.ape",
+        "tests/data/test_mono_reference.wav",
+        1, 4000,
+    );
+}
+
+#[test]
+fn mono_c5000_insane() {
+    verify_ape_vs_wav(
+        "tests/data/test_mono_c5000.ape",
+        "tests/data/test_mono_reference.wav",
+        1, 5000,
+    );
+}
+
+// ── Compression level tests: stereo ────────────────────────────────
+
+#[test]
+fn stereo_c1000_fast() {
+    verify_ape_vs_wav(
+        "tests/data/test_stereo_c1000.ape",
+        "tests/data/test_stereo_reference.wav",
+        2, 1000,
+    );
+}
+
+#[test]
+fn stereo_c2000_normal() {
+    verify_ape_vs_wav(
+        "tests/data/test_stereo_c2000.ape",
+        "tests/data/test_stereo_reference.wav",
+        2, 2000,
+    );
+}
+
+#[test]
+fn stereo_c3000_high() {
+    verify_ape_vs_wav(
+        "tests/data/test_stereo_c3000.ape",
+        "tests/data/test_stereo_reference.wav",
+        2, 3000,
+    );
+}
+
+#[test]
+fn stereo_c4000_extra_high() {
+    verify_ape_vs_wav(
+        "tests/data/test_stereo_c4000.ape",
+        "tests/data/test_stereo_reference.wav",
+        2, 4000,
+    );
+}
+
+#[test]
+fn stereo_c5000_insane() {
+    verify_ape_vs_wav(
+        "tests/data/test_stereo_c5000.ape",
+        "tests/data/test_stereo_reference.wav",
+        2, 5000,
+    );
+}
+
+// ── Test helpers ───────────────────────────────────────────────────
+
+/// Decode an APE file and verify bit-exact match against a WAV reference.
+fn verify_ape_vs_wav(
+    ape_path: &str,
+    wav_path: &str,
+    expected_channels: u16,
+    expected_level: u16,
+) {
+    if !Path::new(ape_path).exists() || !Path::new(wav_path).exists() {
+        eprintln!("Skipping: {ape_path} or {wav_path} not found");
+        return;
+    }
+
+    let mut reader = ApeReader::open(ape_path).expect("Failed to open APE file");
+    let info = reader.info().clone();
+
+    assert_eq!(info.channels, expected_channels,
+        "{ape_path}: expected {expected_channels} channels, got {}", info.channels);
+    assert_eq!(info.compression_level, expected_level,
+        "{ape_path}: expected level {expected_level}, got {}", info.compression_level);
+
+    let expected_total = info.total_samples as usize;
+    let mut ape_samples = Vec::with_capacity(expected_total);
+    for result in reader.samples() {
+        ape_samples.push(result.unwrap_or_else(|e| {
+            panic!("{ape_path}: decode error at sample {}: {e}", ape_samples.len())
+        }));
+    }
+
+    assert_eq!(ape_samples.len(), expected_total,
+        "{ape_path}: decoded {} samples, expected {expected_total}", ape_samples.len());
+
+    let wav_data = std::fs::read(wav_path).expect("Failed to read WAV");
+    let wav_samples = parse_wav_samples(&wav_data, info.bits_per_sample);
+
+    let compare_len = expected_total.min(wav_samples.len());
+    let label = format!("{ape_path} ({}ch c{})", info.channels, info.compression_level);
+    assert_bit_exact(&ape_samples, &wav_samples, compare_len, &label);
+}
+
+/// Assert that two sample arrays are bit-exact, with diagnostics on failure.
+fn assert_bit_exact(ape: &[i32], wav: &[i32], len: usize, label: &str) {
+    let mut mismatches = 0u64;
+    let mut max_diff = 0i64;
+    let mut first_mismatch = None;
+
+    for i in 0..len {
+        let diff = (ape[i] as i64 - wav[i] as i64).abs();
         if diff > 0 {
+            if first_mismatch.is_none() {
+                first_mismatch = Some(i);
+            }
             mismatches += 1;
             if diff > max_diff {
                 max_diff = diff;
             }
-            total_diff += diff;
         }
     }
 
-    let avg_diff = if mismatches > 0 {
-        total_diff as f64 / mismatches as f64
-    } else {
-        0.0
-    };
-
-    eprintln!("Results: {mismatches}/{compare_len} samples differ");
-    eprintln!("  Max diff: {max_diff}");
-    eprintln!("  Avg diff (of mismatches): {avg_diff:.2}");
-
     if mismatches == 0 {
-        eprintln!("PERFECT: bit-exact match!");
+        eprintln!("{label}: PASS — {len} samples bit-exact");
+    } else {
+        let idx = first_mismatch.unwrap();
+        eprintln!("{label}: FAIL — {mismatches}/{len} mismatches, max_diff={max_diff}");
+        eprintln!("  First mismatch at sample {idx}: APE={}, WAV={}", ape[idx], wav[idx]);
     }
 
-    // Lossless codec — samples must be bit-exact
     assert_eq!(mismatches, 0,
-        "Lossless decode mismatch: {mismatches} samples differ, max_diff={max_diff}");
+        "{label}: {mismatches} samples differ (max_diff={max_diff})");
 }
 
-/// Parse 16-bit PCM samples from a WAV file (minimal parser, assumes standard format).
+/// Parse PCM samples from a WAV file (16-bit or 24-bit).
 fn parse_wav_samples(data: &[u8], bits_per_sample: u16) -> Vec<i32> {
-    // Find "data" chunk
-    let mut pos = 12; // Skip RIFF header (12 bytes)
+    let mut pos = 12; // Skip RIFF header
     while pos + 8 <= data.len() {
         let chunk_id = &data[pos..pos + 4];
         let chunk_size = u32::from_le_bytes([
@@ -229,12 +309,7 @@ fn parse_wav_samples(data: &[u8], bits_per_sample: u16) -> Vec<i32> {
                     .chunks_exact(3)
                     .map(|c| {
                         let raw = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
-                        // Sign-extend from 24-bit
-                        if raw & 0x800000 != 0 {
-                            raw | !0xFFFFFF
-                        } else {
-                            raw
-                        }
+                        if raw & 0x800000 != 0 { raw | !0xFFFFFF } else { raw }
                     })
                     .collect(),
                 _ => panic!("Unsupported bits_per_sample: {bits_per_sample}"),
@@ -242,7 +317,6 @@ fn parse_wav_samples(data: &[u8], bits_per_sample: u16) -> Vec<i32> {
         }
 
         pos += chunk_size;
-        // WAV chunks are word-aligned
         if chunk_size % 2 != 0 {
             pos += 1;
         }
