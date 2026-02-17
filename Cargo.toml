@@ -1,0 +1,11 @@
+[package]
+name = "ape-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust decoder for Monkey's Audio (APE) lossless audio files"
+license = "MIT"
+repository = "https://github.com/lexicone42/ape-rs"
+keywords = ["audio", "ape", "monkeys-audio", "lossless", "decoder"]
+categories = ["multimedia::audio", "encoding"]
+
+# Zero dependencies — pure Rust

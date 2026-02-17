@@ -1,0 +1,206 @@
+//! Frame decoder — orchestrates the APE decode pipeline.
+//!
+//! Per-frame pipeline:
+//! 1. Seek to frame offset, read compressed data
+//! 2. Initialize range coder from compressed data
+//! 3. Range-decode residuals
+//! 4. NNFilter inverse (add back short-term correlation)
+//! 5. Predictor inverse (add back linear prediction)
+//! 6. Channel decorrelation inverse (mid/side → L/R)
+//! 7. Output interleaved PCM samples
+
+use std::io::{Read, Seek, SeekFrom};
+
+use crate::buffer::SampleBuffer;
+use crate::error::ApeError;
+use crate::header::ApeFileHeader;
+use crate::nnfilter::NNFilter;
+use crate::predictor::Predictor;
+use crate::range_coder::{RangeCoder, RiceState};
+
+/// Number of blocks decoded per inner loop iteration.
+const BLOCKS_PER_LOOP: u32 = 4608;
+
+/// Frame decoder state.
+pub struct Decoder<R: Read + Seek> {
+    pub reader: R,
+    pub header: ApeFileHeader,
+    /// Current frame index (0-based).
+    current_frame: u32,
+    /// Whether all frames have been decoded.
+    pub finished: bool,
+    /// Output sample buffer.
+    pub buffer: SampleBuffer,
+    /// NNFilter instances — one per channel.
+    filters: Vec<NNFilter>,
+    /// Predictor.
+    predictor: Predictor,
+    /// Compression level set index: (level / 1000) - 1.
+    fset: usize,
+}
+
+impl<R: Read + Seek> Decoder<R> {
+    /// Create a new decoder from a reader and parsed header.
+    pub fn new(reader: R, header: ApeFileHeader) -> Self {
+        let fset = (header.header.compression_level / 1000 - 1) as usize;
+        let channels = header.header.channels as usize;
+
+        // Create one NNFilter per channel
+        let mut filters = Vec::with_capacity(channels);
+        for _ in 0..channels {
+            filters.push(NNFilter::new(fset));
+        }
+
+        Decoder {
+            reader,
+            header,
+            current_frame: 0,
+            finished: false,
+            buffer: SampleBuffer::new(),
+            filters,
+            predictor: Predictor::new(),
+            fset,
+        }
+    }
+
+    /// Get the next buffered sample, if any.
+    pub fn next_sample(&mut self) -> Option<i32> {
+        self.buffer.next_sample()
+    }
+
+    /// Decode the next frame, filling the sample buffer.
+    /// Returns true if samples were decoded, false if stream ended.
+    pub fn decode_next_frame(&mut self) -> Result<bool, ApeError> {
+        if self.current_frame >= self.header.header.total_frames {
+            self.finished = true;
+            return Ok(false);
+        }
+
+        // How many blocks (samples per channel) in this frame?
+        let nblocks = if self.current_frame == self.header.header.total_frames - 1 {
+            self.header.header.final_frame_blocks
+        } else {
+            self.header.header.blocks_per_frame
+        };
+
+        if nblocks == 0 {
+            self.finished = true;
+            return Ok(false);
+        }
+
+        // Read compressed frame data
+        let frame_data = self.read_frame_data()?;
+
+        // Reset filter and predictor state for this frame
+        for f in &mut self.filters {
+            f.reset();
+        }
+        self.predictor.reset();
+        self.buffer.clear();
+
+        // Decode the frame
+        let channels = self.header.header.channels;
+        if channels == 1 {
+            self.decode_frame_mono(&frame_data, nblocks)?;
+        } else {
+            self.decode_frame_stereo(&frame_data, nblocks)?;
+        }
+
+        self.current_frame += 1;
+        Ok(true)
+    }
+
+    /// Read compressed data for the current frame.
+    fn read_frame_data(&mut self) -> Result<Vec<u8>, ApeError> {
+        let frame_idx = self.current_frame as usize;
+        let seek_table = &self.header.seek_table;
+
+        if frame_idx >= seek_table.len() {
+            return Err(ApeError::InvalidSeekTable);
+        }
+
+        let start = seek_table[frame_idx] as u64;
+
+        // End is either the next frame's offset or end of frame data
+        let end = if frame_idx + 1 < seek_table.len() {
+            seek_table[frame_idx + 1] as u64
+        } else {
+            // Last frame: compute from total frame data size
+            let total_data = self.header.descriptor.ape_frame_data_bytes as u64
+                | ((self.header.descriptor.ape_frame_data_bytes_high as u64) << 32);
+            self.header.data_offset + total_data
+        };
+
+        let size = (end - start) as usize;
+        if size == 0 {
+            return Err(ApeError::UnexpectedEof);
+        }
+
+        // Seek and read
+        self.reader.seek(SeekFrom::Start(start))?;
+        let mut data = vec![0u8; size];
+        self.reader.read_exact(&mut data)?;
+
+        Ok(data)
+    }
+
+    /// Decode a mono frame.
+    fn decode_frame_mono(
+        &mut self,
+        frame_data: &[u8],
+        nblocks: u32,
+    ) -> Result<(), ApeError> {
+        // Skip initial frame alignment bytes (0-3 bytes based on seek table offset)
+        let skip = (self.header.seek_table[self.current_frame as usize] & 3) as usize;
+        let data = &frame_data[skip..];
+
+        let mut rc = RangeCoder::new(data);
+        let mut rice = RiceState::new();
+
+        for _ in 0..nblocks {
+            // 1. Range decode residual
+            let residual = rc.decode_value(&mut rice);
+
+            // 2. NNFilter inverse
+            let filtered = self.filters[0].decompress(residual);
+
+            // 3. Predictor inverse
+            let sample = self.predictor.decode_mono(filtered);
+
+            self.buffer.push(sample);
+        }
+
+        Ok(())
+    }
+
+    /// Decode a stereo frame.
+    fn decode_frame_stereo(
+        &mut self,
+        frame_data: &[u8],
+        nblocks: u32,
+    ) -> Result<(), ApeError> {
+        let skip = (self.header.seek_table[self.current_frame as usize] & 3) as usize;
+        let data = &frame_data[skip..];
+
+        let mut rc = RangeCoder::new(data);
+        let mut rice_y = RiceState::new();
+        let mut rice_x = RiceState::new();
+
+        for _ in 0..nblocks {
+            // Decode Y channel (first in stereo)
+            let residual_y = rc.decode_value(&mut rice_y);
+            let filtered_y = self.filters[0].decompress(residual_y);
+
+            // Decode X channel
+            let residual_x = rc.decode_value(&mut rice_x);
+            let filtered_x = self.filters[1].decompress(residual_x);
+
+            // Predictor inverse + channel decorrelation
+            let (left, right) = self.predictor.decode_stereo(filtered_y, filtered_x);
+
+            self.buffer.push_stereo(left, right);
+        }
+
+        Ok(())
+    }
+}
