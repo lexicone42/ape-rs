@@ -126,8 +126,11 @@ impl<R: Read + Seek> Decoder<R> {
         // Start at 4-byte aligned position (low 2 bits are alignment skip)
         let start = (seek_table[frame_idx] & !3) as u64;
 
-        // End is either the next frame's offset or end of frame data
-        let end = if frame_idx + 1 < seek_table.len() {
+        // End is either the next frame's offset or end of frame data.
+        // Use total_frames (not seek_table.len()) — the seek table may be
+        // pre-allocated to a maximum size with zero-filled trailing entries.
+        let total_frames = self.header.header.total_frames as usize;
+        let end = if frame_idx + 1 < total_frames {
             seek_table[frame_idx + 1] as u64
         } else {
             // Last frame: compute from total frame data size
