@@ -116,3 +116,7 @@ This is an original Rust implementation. The Monkey's Audio format has limited p
 ## License
 
 MIT
+
+## Acknowledgments
+
+[Monkey's Audio](https://www.monkeysaudio.com/) is by Matthew T. Ashland. [FFmpeg](https://ffmpeg.org/) (LGPL) was used as a reference for verification.
