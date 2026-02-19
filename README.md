@@ -109,6 +109,10 @@ cargo test --release
 - No APEv2 tag parsing (metadata tags at EOF are ignored).
 - No encoding, decode only.
 
+## Implementation notes
+
+This is an original Rust implementation. The Monkey's Audio format has limited public documentation; behavior was derived from the format header specification and empirical testing against FFmpeg's decoder output. Output is verified bit-exact against FFmpeg across millions of samples.
+
 ## License
 
 MIT
